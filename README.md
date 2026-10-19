@@ -13,3 +13,9 @@ git clone <本仓库> && cd claude-statusline && ./install.sh
 ```
 
 `install.sh` 只修改 `~/.claude/settings.json` 的 `statusLine` 字段。仓库不包含任何凭据。
+
+## 反向同步（本机改了脚本后）
+
+```bash
+./sync.sh "说明"   # 复制 ~/.claude 下的脚本，有变化则提交并推送
+```
