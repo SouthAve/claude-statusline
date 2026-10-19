@@ -1,5 +1,7 @@
 # claude-statusline
 
+![cc-statusline-styled](README.assets/cc-statusline-styled.png)
+
 Claude Code 两行状态栏（Bash + jq）。
 
 - 第 1 行：模型、思考程度、目录、Git 分支/改动、ctx 用量
