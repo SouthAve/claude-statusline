@@ -198,6 +198,84 @@ elif [ -n "$dur_seg" ]; then addf "" "$dur_seg"
 fi
 
 # ---- 限额并入第 2 行末尾（仅存在数据时显示）----
+# 5h/7d 限额缓存：限额是账号级数据，但新对话首次 API 响应前输入里没有 rate_limits，因此加一层缓存——
+#   输入有数据：逐个窗口与缓存比较，比缓存新才原子写入（先写临时文件再 mv）。"新" 指重置时间更晚，
+#               或重置时间相同但用量更高；这样多个会话并发时，落后的会话不会把新值覆盖回去、每秒来回写盘
+#   输入没数据：回退到缓存；缓存里重置时间已过的窗口已经重置、旧百分比不再准确，直接不显示
+#   从未缓存过（如按 API 计费的账号）、或缓存损坏/读不出来：与原来一致，完全不显示
+# 缓存文件是一行 JSON（缺失的窗口为 null），要清除缓存直接删除对应文件：
+#   {"five_hour":{"used_percentage":42,"resets_at":1760007200},"seven_day":{"used_percentage":18,"resets_at":1760259200}}
+# 缓存按环境指纹分开存放，所以网关或 API 密钥会话读不到订阅账号的数据（它们收不到 rate_limits，自己的缓存始终为空）：
+#   指纹 = ANTHROPIC_BASE_URL 与 CLAUDE_CONFIG_DIR 的值，加上 ANTHROPIC_API_KEY、ANTHROPIC_AUTH_TOKEN 是否非空的标记；
+#   密钥和令牌只用"是否存在"，值绝不写进文件名或任何文件。
+#   四个变量都为空（默认登录账号）：$state_dir/rate-limits-cache.json，此路径不 fork 任何子进程
+#   任一非空：$state_dir/rate-limits-cache-<h>.json，<h> 为指纹的 cksum（写法同 sid_hash，仅此时才计算）
+#   $state_dir 默认 ~/.claude/statusline-state，可用 STATUSLINE_STATE_DIR 改
+# 局限：同一个配置目录里用 /login 切换账号无法从环境判断，旧账号的值会保留到它的窗口结束（或手动删除缓存文件）
+rl_fp="${ANTHROPIC_BASE_URL}|${CLAUDE_CONFIG_DIR}|${ANTHROPIC_API_KEY:+k}${ANTHROPIC_AUTH_TOKEN:+t}"
+rl_cache="$state_dir/rate-limits-cache.json"
+if [ "$rl_fp" != "||" ]; then
+  rl_h=$(printf '%s' "$rl_fp" | cksum | cut -d' ' -f1)
+  rl_cache="$state_dir/rate-limits-cache-$rl_h.json"
+fi
+rl_ok() { isint "$1" && [ "${#1}" -le "$2" ]; } # 纯数字且不超过 $2 位（防御损坏的缓存）
+rl_norm() { # $1 百分比 $2 重置 epoch（均可含小数）→ RL_P / RL_R，任一非法则均为空
+  RL_P=""; RL_R=""
+  [ -n "$1" ] && [ -n "$2" ] || return 0
+  local p r="${2%.*}"
+  printf -v p '%.0f' "$1" 2>/dev/null || return 0
+  rl_ok "$p" 4 && rl_ok "$r" 11 && { RL_P=$p; RL_R=$r; }
+  return 0
+}
+rl_line() { # $1/$2 5h 百分比/重置  $3/$4 7d 百分比/重置 → RL_LINE（缓存文件内容）
+  local a=null b=null
+  [ -n "$2" ] && printf -v a '{"used_percentage":%s,"resets_at":%s}' "$1" "$2"
+  [ -n "$4" ] && printf -v b '{"used_percentage":%s,"resets_at":%s}' "$3" "$4"
+  printf -v RL_LINE '{"five_hour":%s,"seven_day":%s}' "$a" "$b"
+}
+rl_newer() { # 输入（$1 百分比 $2 重置）是否比缓存（$3 百分比 $4 重置）更新；缓存为空视为更新
+  [ -n "$4" ] || return 0
+  [ "$2" -gt "$4" ] && return 0
+  [ "$2" -eq "$4" ] && [ "$1" -gt "$3" ]
+}
+rl_write() { # $1 缓存文件内容；先写临时文件再 mv，任何一步失败都静默放弃
+  local tmp="$rl_cache.$$"
+  [ -d "$state_dir" ] || { mkdir -p "$state_dir" && chmod 700 "$state_dir"; } 2>/dev/null || return 0
+  { printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$rl_cache"; } 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+rl_norm "$five" "$five_r"; rl_i5p=$RL_P; rl_i5r=$RL_R
+rl_norm "$week" "$week_r"; rl_i7p=$RL_P; rl_i7r=$RL_R
+# 输入的内容与缓存文件完全一致（常态）时什么都不用做，也省掉一次 jq（此路径全是 shell 内建，零 fork）
+rl_line "$rl_i5p" "$rl_i5r" "$rl_i7p" "$rl_i7r"
+rl_old=""
+[ -f "$rl_cache" ] && { IFS= read -r rl_old <"$rl_cache"; } 2>/dev/null
+if [ "$rl_old" != "$RL_LINE" ]; then
+  rl_c5p=""; rl_c5r=""; rl_c7p=""; rl_c7r=""
+  if [ -f "$rl_cache" ]; then
+    IFS=$US read -r rl_c5p rl_c5r rl_c7p rl_c7r <<<"$(jq -r '
+      [ .five_hour.used_percentage, .five_hour.resets_at,
+        .seven_day.used_percentage, .seven_day.resets_at
+      ] | map(if . == null then "" else tostring end) | join("\u001f")' 2>/dev/null <"$rl_cache")"
+  fi
+  rl_ok "$rl_c5p" 4 && rl_ok "$rl_c5r" 11 || { rl_c5p=""; rl_c5r=""; }
+  rl_ok "$rl_c7p" 4 && rl_ok "$rl_c7r" 11 || { rl_c7p=""; rl_c7r=""; }
+  rl_n5p=$rl_c5p; rl_n5r=$rl_c5r; rl_n7p=$rl_c7p; rl_n7r=$rl_c7r; rl_dirty=""
+  if [ -n "$rl_i5r" ]; then
+    if rl_newer "$rl_i5p" "$rl_i5r" "$rl_c5p" "$rl_c5r"; then rl_n5p=$rl_i5p; rl_n5r=$rl_i5r; rl_dirty=1; fi
+  elif [ -z "$five" ] && [ -n "$rl_c5r" ] && [ "$rl_c5r" -gt "$now" ]; then
+    five=$rl_c5p; five_r=$rl_c5r   # 输入没有 5h：用未过期的缓存
+  fi
+  if [ -n "$rl_i7r" ]; then
+    if rl_newer "$rl_i7p" "$rl_i7r" "$rl_c7p" "$rl_c7r"; then rl_n7p=$rl_i7p; rl_n7r=$rl_i7r; rl_dirty=1; fi
+  elif [ -z "$week" ] && [ -n "$rl_c7r" ] && [ "$rl_c7r" -gt "$now" ]; then
+    week=$rl_c7p; week_r=$rl_c7r   # 输入没有 7d：用未过期的缓存
+  fi
+  if [ -n "$rl_dirty" ]; then
+    rl_line "$rl_n5p" "$rl_n5r" "$rl_n7p" "$rl_n7r"
+    rl_write "$RL_LINE"
+  fi
+fi
 limit_seg "5h" "$five" "$five_r" "%H:%M" "$C_5H"
 limit_seg "7d" "$week" "$week_r" "%m/%d %H:%M" "$C_7D"
 # Fable 独立周额度：只读本地私有缓存；过期时后台异步刷新，绝不阻塞显示
