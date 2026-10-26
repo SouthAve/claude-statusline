@@ -36,8 +36,22 @@ line=$(printf '%s' "$resp" | jq -r '
       and ((.scope.model.display_name // "") | ascii_downcase | startswith("fable")))][0]
   | select(. != null and .percent != null and .resets_at != null)
   | "\(.percent) \(.resets_at | sub("\\.[0-9]+"; "") | sub("[+-]00:00$"; "Z") | fromdateiso8601)"' 2>/dev/null)
+# 5h/7d 限额：仅当状态栏传入 STATUSLINE_RL_CACHE（默认登录账号会话，令牌与该账号一致）时才写入；
+# 格式与状态栏的限额缓存一致，at 为写入时间；任一窗口缺失或非法则整体放弃，保留原缓存
+rl_json=""
+if [ -n "$STATUSLINE_RL_CACHE" ]; then
+  rl_json=$(printf '%s' "$resp" | jq -c --argjson at "$(date +%s)" '
+    def win($w): $w | select(. != null and .utilization != null and .resets_at != null)
+      | {used_percentage: (.utilization | round),
+         resets_at: (.resets_at | sub("\\.[0-9]+"; "") | sub("[+-]00:00$"; "Z") | fromdateiso8601)};
+    {five_hour: win(.five_hour), seven_day: win(.seven_day), at: $at}' 2>/dev/null)
+fi
 resp=""
 case "$line" in
   [0-9]*" "[0-9]*) printf '%s %s\n' "$line" "$(date +%s)" >"$cache.tmp.$$" && mv "$cache.tmp.$$" "$cache" ;;
+esac
+case "$rl_json" in
+  '{"five_hour":{"used_percentage":'[0-9]*'"seven_day":{"used_percentage":'[0-9]*'"at":'[0-9]*'}')
+    printf '%s\n' "$rl_json" >"$STATUSLINE_RL_CACHE.$$" && mv -f "$STATUSLINE_RL_CACHE.$$" "$STATUSLINE_RL_CACHE" ;;
 esac
 exit 0

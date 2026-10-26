@@ -75,13 +75,13 @@ fmt_cd() { # 倒计时
   else printf '%dm' $(((d + 59) / 60)); fi
 }
 
-# 限额片段：$1 标签 $2 百分比 $3 重置epoch $4 时间格式
+# 限额片段：$1 标签 $2 百分比 $3 重置epoch $4 时间格式 $5 颜色 $6 百分比前缀（可空）
 limit_seg() {
   local p r="" long col="${5:-$C_XL}"
   [ -n "$2" ] || return 0
   p=$(printf '%.0f' "$2" 2>/dev/null) || return 0
   isint "$p" || return 0
-  long="$1 ${p}%"
+  long="$1 ${6}${p}%"   # $6 非空时作为百分比前缀（"~" 表示缓存估计值）
   if isint "${3%.*}" && [ -n "$3" ]; then
     r=$(fmt_cd "$3")
     long="$long ↻$(fmt_ts "${3%.*}" "$4") ($r)"
@@ -199,12 +199,16 @@ fi
 
 # ---- 限额并入第 2 行末尾（仅存在数据时显示）----
 # 5h/7d 限额缓存：限额是账号级数据，但新对话首次 API 响应前输入里没有 rate_limits，因此加一层缓存——
-#   输入有数据：逐个窗口与缓存比较，比缓存新才原子写入（先写临时文件再 mv）。"新" 指重置时间更晚，
-#               或重置时间相同但用量更高；这样多个会话并发时，落后的会话不会把新值覆盖回去、每秒来回写盘
-#   输入没数据：回退到缓存；缓存里重置时间已过的窗口已经重置、旧百分比不再准确，直接不显示
+#   输入有数据：直接显示输入。当"本会话的输入与本会话上次写缓存时不同"（说明刚收到一次新的 API 响应）时，
+#               把输入原子写入缓存（先写临时文件再 mv），后写者胜出、允许用量下降：
+#               旧逻辑只接受"重置更晚或用量更高"的值，账号用量被回退/重置（同一重置时间下用量变低）后缓存永远停在旧的高值（如 99%），
+#               每个新会话在首次对话前都会显示它。按会话记录"上次写入的输入"（rl-in-<会话哈希>），
+#               空闲会话输入不变就不会写缓存，因此不会用旧数据覆盖其它会话的新值，也不会每秒写盘
+#   输入没数据：回退到缓存，但显示为 "~99%" 表示是缓存的估计值；缓存里重置时间已过的窗口已经重置，缓存写入时间
+#               超过 STATUSLINE_RL_MAX_AGE 秒（默认 21600 = 6 小时）或没有写入时间（旧格式缓存）都视为过期，不显示
 #   从未缓存过（如按 API 计费的账号）、或缓存损坏/读不出来：与原来一致，完全不显示
-# 缓存文件是一行 JSON（缺失的窗口为 null），要清除缓存直接删除对应文件：
-#   {"five_hour":{"used_percentage":42,"resets_at":1760007200},"seven_day":{"used_percentage":18,"resets_at":1760259200}}
+# 缓存文件是一行 JSON（缺失的窗口为 null，at 为写入时间），要清除缓存直接删除对应文件：
+#   {"five_hour":{"used_percentage":42,"resets_at":1760007200},"seven_day":{"used_percentage":18,"resets_at":1760259200},"at":1760000000}
 # 缓存按环境指纹分开存放，所以网关或 API 密钥会话读不到订阅账号的数据（它们收不到 rate_limits，自己的缓存始终为空）：
 #   指纹 = ANTHROPIC_BASE_URL 与 CLAUDE_CONFIG_DIR 的值，加上 ANTHROPIC_API_KEY、ANTHROPIC_AUTH_TOKEN 是否非空的标记；
 #   密钥和令牌只用"是否存在"，值绝不写进文件名或任何文件。
@@ -227,57 +231,70 @@ rl_norm() { # $1 百分比 $2 重置 epoch（均可含小数）→ RL_P / RL_R�
   rl_ok "$p" 4 && rl_ok "$r" 11 && { RL_P=$p; RL_R=$r; }
   return 0
 }
-rl_line() { # $1/$2 5h 百分比/重置  $3/$4 7d 百分比/重置 → RL_LINE（缓存文件内容）
+rl_line() { # $1/$2 5h 百分比/重置  $3/$4 7d 百分比/重置  $5 写入时间（可空）→ RL_LINE
   local a=null b=null
   [ -n "$2" ] && printf -v a '{"used_percentage":%s,"resets_at":%s}' "$1" "$2"
   [ -n "$4" ] && printf -v b '{"used_percentage":%s,"resets_at":%s}' "$3" "$4"
-  printf -v RL_LINE '{"five_hour":%s,"seven_day":%s}' "$a" "$b"
+  if [ -n "$5" ]; then printf -v RL_LINE '{"five_hour":%s,"seven_day":%s,"at":%s}' "$a" "$b" "$5"
+  else printf -v RL_LINE '{"five_hour":%s,"seven_day":%s}' "$a" "$b"; fi
 }
-rl_newer() { # 输入（$1 百分比 $2 重置）是否比缓存（$3 百分比 $4 重置）更新；缓存为空视为更新
-  [ -n "$4" ] || return 0
-  [ "$2" -gt "$4" ] && return 0
-  [ "$2" -eq "$4" ] && [ "$1" -gt "$3" ]
-}
-rl_write() { # $1 缓存文件内容；先写临时文件再 mv，任何一步失败都静默放弃
-  local tmp="$rl_cache.$$"
+rl_write() { # $1 文件内容 $2 目标文件；先写临时文件再 mv，任何一步失败都静默放弃
+  local tmp="$2.$$"
   [ -d "$state_dir" ] || { mkdir -p "$state_dir" && chmod 700 "$state_dir"; } 2>/dev/null || return 0
-  { printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$rl_cache"; } 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  { printf '%s\n' "$1" >"$tmp" && mv -f "$tmp" "$2"; } 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+rl_load() { # 读缓存 → rl_c5p rl_c5r rl_c7p rl_c7r rl_cat（非法字段置空）
+  rl_c5p=""; rl_c5r=""; rl_c7p=""; rl_c7r=""; rl_cat=""
+  [ -f "$rl_cache" ] || return 0
+  IFS=$US read -r rl_c5p rl_c5r rl_c7p rl_c7r rl_cat <<<"$(jq -r '
+    [ .five_hour.used_percentage, .five_hour.resets_at,
+      .seven_day.used_percentage, .seven_day.resets_at, .at
+    ] | map(if . == null then "" else tostring end) | join("\u001f")' 2>/dev/null <"$rl_cache")"
+  rl_ok "$rl_c5p" 4 && rl_ok "$rl_c5r" 11 || { rl_c5p=""; rl_c5r=""; }
+  rl_ok "$rl_c7p" 4 && rl_ok "$rl_c7r" 11 || { rl_c7p=""; rl_c7r=""; }
+  rl_ok "$rl_cat" 11 || rl_cat=""
   return 0
 }
 rl_norm "$five" "$five_r"; rl_i5p=$RL_P; rl_i5r=$RL_R
 rl_norm "$week" "$week_r"; rl_i7p=$RL_P; rl_i7r=$RL_R
-# 输入的内容与缓存文件完全一致（常态）时什么都不用做，也省掉一次 jq（此路径全是 shell 内建，零 fork）
-rl_line "$rl_i5p" "$rl_i5r" "$rl_i7p" "$rl_i7r"
-rl_old=""
-[ -f "$rl_cache" ] && { IFS= read -r rl_old <"$rl_cache"; } 2>/dev/null
-if [ "$rl_old" != "$RL_LINE" ]; then
-  rl_c5p=""; rl_c5r=""; rl_c7p=""; rl_c7r=""
-  if [ -f "$rl_cache" ]; then
-    IFS=$US read -r rl_c5p rl_c5r rl_c7p rl_c7r <<<"$(jq -r '
-      [ .five_hour.used_percentage, .five_hour.resets_at,
-        .seven_day.used_percentage, .seven_day.resets_at
-      ] | map(if . == null then "" else tostring end) | join("\u001f")' 2>/dev/null <"$rl_cache")"
-  fi
-  rl_ok "$rl_c5p" 4 && rl_ok "$rl_c5r" 11 || { rl_c5p=""; rl_c5r=""; }
-  rl_ok "$rl_c7p" 4 && rl_ok "$rl_c7r" 11 || { rl_c7p=""; rl_c7r=""; }
-  rl_n5p=$rl_c5p; rl_n5r=$rl_c5r; rl_n7p=$rl_c7p; rl_n7r=$rl_c7r; rl_dirty=""
-  if [ -n "$rl_i5r" ]; then
-    if rl_newer "$rl_i5p" "$rl_i5r" "$rl_c5p" "$rl_c5r"; then rl_n5p=$rl_i5p; rl_n5r=$rl_i5r; rl_dirty=1; fi
-  elif [ -z "$five" ] && [ -n "$rl_c5r" ] && [ "$rl_c5r" -gt "$now" ]; then
-    five=$rl_c5p; five_r=$rl_c5r   # 输入没有 5h：用未过期的缓存
-  fi
-  if [ -n "$rl_i7r" ]; then
-    if rl_newer "$rl_i7p" "$rl_i7r" "$rl_c7p" "$rl_c7r"; then rl_n7p=$rl_i7p; rl_n7r=$rl_i7r; rl_dirty=1; fi
-  elif [ -z "$week" ] && [ -n "$rl_c7r" ] && [ "$rl_c7r" -gt "$now" ]; then
-    week=$rl_c7p; week_r=$rl_c7r   # 输入没有 7d：用未过期的缓存
-  fi
-  if [ -n "$rl_dirty" ]; then
-    rl_line "$rl_n5p" "$rl_n5r" "$rl_n7p" "$rl_n7r"
-    rl_write "$RL_LINE"
+rl_mark5=""; rl_mark7=""   # 非空表示该窗口的值来自缓存（显示为 ~N%）
+if [ -n "$rl_i5r$rl_i7r" ]; then
+  # 输入有数据：与本会话上次写缓存时的输入一致（常态）就什么都不用做（全是 shell 内建，零 fork）
+  rl_line "$rl_i5p" "$rl_i5r" "$rl_i7p" "$rl_i7r"
+  rl_sig=$RL_LINE
+  rl_sess="$state_dir/rl-in-$sid_hash"
+  rl_old=""
+  [ -f "$rl_sess" ] && { IFS= read -r rl_old <"$rl_sess"; } 2>/dev/null
+  if [ "$rl_old" != "$rl_sig" ]; then
+    rl_load   # 刚收到新的 API 响应：输入覆盖缓存（含用量下降）；输入里缺的窗口保留缓存原值
+    rl_n5p=$rl_c5p; rl_n5r=$rl_c5r; rl_n7p=$rl_c7p; rl_n7r=$rl_c7r
+    [ -n "$rl_i5r" ] && { rl_n5p=$rl_i5p; rl_n5r=$rl_i5r; }
+    [ -n "$rl_i7r" ] && { rl_n7p=$rl_i7p; rl_n7r=$rl_i7r; }
+    rl_line "$rl_n5p" "$rl_n5r" "$rl_n7p" "$rl_n7r" "$now"
+    rl_write "$RL_LINE" "$rl_cache"
+    rl_write "$rl_sig" "$rl_sess"
   fi
 fi
-limit_seg "5h" "$five" "$five_r" "%H:%M" "$C_5H"
-limit_seg "7d" "$week" "$week_r" "%m/%d %H:%M" "$C_7D"
+rl_refresh=""   # 非空表示需要后台从官方用量接口刷新限额缓存（见下方 Fable 刷新）
+if [ -z "$five" ] || [ -z "$week" ]; then
+  # 输入缺窗口（新会话首次响应前）：回退到缓存，仅限未过期的窗口，且缓存本身不能太旧
+  # 缓存写入不超过 300 秒视为实时值（不加 ~）；默认登录账号且缓存超过 60 秒时，触发后台从官方用量接口刷新
+  rl_load
+  [ "$rl_fp" = "||" ] && { [ -z "$rl_cat" ] || [ $((now - rl_cat)) -ge 60 ]; } && rl_refresh=1
+  rl_max="${STATUSLINE_RL_MAX_AGE:-21600}"; isint "$rl_max" || rl_max=21600
+  if [ -n "$rl_cat" ] && [ $((now - rl_cat)) -le "$rl_max" ]; then
+    rl_mk="~"; [ $((now - rl_cat)) -le 300 ] && rl_mk=""
+    if [ -z "$five" ] && [ -n "$rl_c5r" ] && [ "$rl_c5r" -gt "$now" ]; then
+      five=$rl_c5p; five_r=$rl_c5r; rl_mark5=$rl_mk
+    fi
+    if [ -z "$week" ] && [ -n "$rl_c7r" ] && [ "$rl_c7r" -gt "$now" ]; then
+      week=$rl_c7p; week_r=$rl_c7r; rl_mark7=$rl_mk
+    fi
+  fi
+fi
+limit_seg "5h" "$five" "$five_r" "%H:%M" "$C_5H" "$rl_mark5"
+limit_seg "7d" "$week" "$week_r" "%m/%d %H:%M" "$C_7D" "$rl_mark7"
 # Fable 独立周额度：只读本地私有缓存；过期时后台异步刷新，绝不阻塞显示
 fable_cache="$state_dir/fable"
 fb_pct=""; fb_reset=""; fb_at=0
@@ -288,10 +305,13 @@ fi
 now_ts=$(date +%s)
 attempt_at=$(stat -f %m "$state_dir/fable.attempt" 2>/dev/null || stat -c %Y "$state_dir/fable.attempt" 2>/dev/null)
 isint "$attempt_at" || attempt_at=0
-# 缓存超过 5 分钟、或其重置时间已过，且距上次尝试超过 60 秒才触发后台刷新
-if { [ $((now_ts - fb_at)) -ge 300 ] || { [ -n "$fb_reset" ] && [ "$fb_reset" -le "$now_ts" ]; }; } \
+# Fable 缓存超过 5 分钟、或其重置时间已过、或 5h/7d 限额需要刷新，且距上次尝试超过 60 秒才触发后台刷新
+# 同一次请求顺带写 5h/7d 限额缓存，但只在默认登录账号会话里传入缓存路径（网关/API 密钥会话不写）
+if { [ $((now_ts - fb_at)) -ge 300 ] || { [ -n "$fb_reset" ] && [ "$fb_reset" -le "$now_ts" ]; } || [ -n "$rl_refresh" ]; } \
    && [ $((now_ts - attempt_at)) -ge 60 ] && [ -x "$HOME/.claude/statusline-fable-refresh.sh" ]; then
-  STATUSLINE_STATE_DIR="$state_dir" nohup "$HOME/.claude/statusline-fable-refresh.sh" >/dev/null 2>&1 </dev/null &
+  rl_pass=""; [ "$rl_fp" = "||" ] && rl_pass=$rl_cache
+  STATUSLINE_STATE_DIR="$state_dir" STATUSLINE_RL_CACHE="$rl_pass" \
+    nohup "$HOME/.claude/statusline-fable-refresh.sh" >/dev/null 2>&1 </dev/null &
   disown 2>/dev/null
 fi
 # 窗口已重置则不显示过期数据，等待后台刷新
